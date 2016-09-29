@@ -1,9 +1,9 @@
 import re
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 
 import pkg_resources
 import sqlalchemy as sa
-from sqlalchemy import Column, exc, inspect, schema
+from sqlalchemy import Column, exc, inspect
 from sqlalchemy.dialects.postgresql.base import PGCompiler, PGDDLCompiler
 from sqlalchemy.dialects.postgresql.psycopg2 import PGDialect_psycopg2
 from sqlalchemy.engine import reflection
@@ -97,38 +97,34 @@ PRIMARY_KEY_RE = re.compile(r"""
 """, re.VERBOSE)
 
 
-def _get_relation_key(name, schema):
-    if schema is None:
-        return name
-    else:
-        return schema + "." + name
+class RelationKey(namedtuple('RelationKey', ('name', 'schema'))):
+    __slots__ = ()
 
+    def __new__(cls, name, schema=None, connection=None):
+        if schema is None and connection is None:
+            raise ValueError("Must specify either schema or connection")
+        if schema is None:
+            schema = inspect(connection).default_schema_name
+        return super(RelationKey, cls).__new__(cls, name, schema)
 
-def _get_schema_and_relation(key):
-    if '.' not in key:
-        return (None, key)
+    def __str__(self):
+        if self.schema is None:
+            return self.name
+        else:
+            return self.schema + "." + self.name
 
-    # capture and split on anything that's not a period or double quote OR
-    # something that is anything in double quotes
-    identifiers = re.split(r'''((?:[^."]|"[^"]*")+)''', key)[1::2]
-    if len(identifiers) == 1:
-        return (None, key)
-    elif len(identifiers) == 2:
-        return tuple(identifiers)
-    raise ValueError("%s does not look like a valid relation identifier")
+    def unquoted(self):
+        """
+        Return *key* with one level of double quotes removed.
 
-
-def unquoted(key):
-    """
-    Return *key* with one level of double quotes removed.
-
-    Redshift stores some identifiers without quotes in internal tables,
-    even though the name must be quoted elsewhere.
-    In particular, this happens for tables named as a keyword.
-    """
-    if key.startswith('"') and key.endswith('"'):
-        return key[1:-1]
-    return key
+        Redshift stores some identifiers without quotes in internal tables,
+        even though the name must be quoted elsewhere.
+        In particular, this happens for tables named as a keyword.
+        """
+        key = str(self)
+        if key.startswith('"') and key.endswith('"'):
+            return key[1:-1]
+        return key
 
 
 class RedshiftCompiler(PGCompiler):
@@ -324,12 +320,12 @@ class RedshiftDialect(PGDialect_psycopg2):
     statement_compiler = RedshiftCompiler
     ddl_compiler = RedshiftDDLCompiler
     construct_arguments = [
-        (schema.Index, {
+        (sa.schema.Index, {
             "using": False,
             "where": None,
             "ops": {}
         }),
-        (schema.Table, {
+        (sa.schema.Table, {
             "ignore_search_path": False,
             "diststyle": None,
             "distkey": None,
@@ -552,11 +548,8 @@ class RedshiftDialect(PGDialect_psycopg2):
                                                     info_cache=info_cache)
         relation_names = []
         for key, relation in all_relations.items():
-            this_schema, this_relation = _get_schema_and_relation(key)
-            if this_schema is None:
-                this_schema = default_schema
-            if this_schema == schema and relation.relkind == relkind:
-                relation_names.append(this_relation)
+            if key.schema == schema and relation.relkind == relkind:
+                relation_names.append(key.name)
         return relation_names
 
     def _get_column_info(self, *args, **kwargs):
@@ -580,9 +573,9 @@ class RedshiftDialect(PGDialect_psycopg2):
         info_cache = kw.get('info_cache')
         all_relations = self._get_all_relation_info(connection,
                                                     info_cache=info_cache)
-        key = _get_relation_key(table_name, schema)
+        key = RelationKey(table_name, schema, connection)
         if key not in all_relations.keys():
-            key = unquoted(key)
+            key = key.unquoted()
         try:
             return all_relations[key]
         except KeyError:
@@ -592,9 +585,9 @@ class RedshiftDialect(PGDialect_psycopg2):
         info_cache = kw.get('info_cache')
         all_columns = self._get_all_column_info(connection,
                                                 info_cache=info_cache)
-        key = _get_relation_key(table_name, schema)
+        key = RelationKey(table_name, schema, connection)
         if key not in all_columns.keys():
-            key = unquoted(key)
+            key = key.unquoted()
         return all_columns[key]
 
     def _get_redshift_constraints(self, connection, table_name,
@@ -602,9 +595,9 @@ class RedshiftDialect(PGDialect_psycopg2):
         info_cache = kw.get('info_cache')
         all_constraints = self._get_all_constraint_info(connection,
                                                         info_cache=info_cache)
-        key = _get_relation_key(table_name, schema)
+        key = RelationKey(table_name, schema, connection)
         if key not in all_constraints.keys():
-            key = unquoted(key)
+            key = key.unquoted()
         return all_constraints[key]
 
     @reflection.cache
@@ -633,11 +626,9 @@ class RedshiftDialect(PGDialect_psycopg2):
         """)
         relations = {}
         for rel in result:
-            schema = rel.schema
-            if schema == inspect(connection).default_schema_name:
-                schema = None
-            key = _get_relation_key(rel.relname, schema)
+            key = RelationKey(rel.relname, rel.schema, connection)
             relations[key] = rel
+        print(relations)
         return relations
 
     @reflection.cache
@@ -686,10 +677,7 @@ class RedshiftDialect(PGDialect_psycopg2):
             ORDER BY n.nspname, c.relname, att.attnum
             """)
             for col in result:
-                schema = col.schema
-                if schema == inspect(connection).default_schema_name:
-                    schema = None
-                key = _get_relation_key(col.table_name, schema)
+                key = RelationKey(col.table_name, col.schema, connection)
                 all_columns[key].append(col)
 
             cc.execute("SET LOCAL search_path TO %s" % search_path)
@@ -722,10 +710,7 @@ class RedshiftDialect(PGDialect_psycopg2):
         """)
         all_constraints = defaultdict(list)
         for con in result:
-            schema = con.schema
-            if schema == inspect(connection).default_schema_name:
-                schema = None
-            key = _get_relation_key(con.table_name, schema)
+            key = RelationKey(con.table_name, con.schema, connection)
             all_constraints[key].append(con)
         return all_constraints
 
